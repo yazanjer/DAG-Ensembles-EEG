@@ -1,0 +1,113 @@
+# =============================================================================
+# config.yaml  —  single source of truth for all DAG-SA hyper-parameters.
+# Printed at run start and copied to <results>/config_used.yaml for every run
+# (Reviewer 2 comment #6: surface every implementation detail).
+# Edit here rather than in code. env_utils.load_config() deep-merges this file
+# over the built-in defaults.
+# =============================================================================
+
+# ---- Reproducibility --------------------------------------------------------
+seed: 42                       # default single-run seed (kept for parity)
+seeds: [42, 43, 44, 45, 46, 47, 48, 49]   # the eight seeds every method uses (R2-3)
+
+# ---- Evaluation protocol ----------------------------------------------------
+eval_protocol: split           # 'split' (3-way) or 'cv' (nested repeated k-fold)
+cv:
+  n_splits: 5                  # repeated stratified k-fold (R1-2)
+  n_repeats: 5
+
+# ---- Epoching / feature grid ------------------------------------------------
+window_sizes: [[0, 4], [1, 3]]           # (start, end) seconds
+component_options: [[6, 7, 8], [4, 5, 6, 7, 8]]
+
+# ---- Preprocessing (R2-6: state every detail) -------------------------------
+preprocessing:
+  bandpass_type: butterworth
+  bandpass_order: 5            # Butterworth order
+  cssp_delay: 2                # CSSP embedding delay (samples)
+  csp_reg: null                # null | float | 'ledoit_wolf' | 'oas'
+  csp_log: true
+  downsample_to: null          # target Hz, null = keep native fs
+  artefact_handling: none
+  trial_rejection: none
+  channel_selection: all
+
+# ---- Simulated annealing ----------------------------------------------------
+sa:
+  iterations: 300
+  temp: 5.0
+  cooling_rate: 0.97
+  nreheat: 20
+  checkpoint_every: 25         # periodic checkpoint cadence in iterations (Section A.3)
+  checkpoint_minutes: 10       # wall-clock checkpoint cadence in minutes (Section B.1)
+
+# ---- Random search (matched to SA budget for fairness, R2-6) ----------------
+random_search:
+  iterations: 300
+
+# ---- Classifier pool grids --------------------------------------------------
+svm_grid:
+  - {kernel: linear, C: 0.1}
+  - {kernel: linear, C: 1.0}
+  - {kernel: linear, C: 10.0}
+  - {kernel: rbf, C: 1.0, gamma: scale}
+  - {kernel: rbf, C: 10.0, gamma: scale}
+  - {kernel: rbf, C: 100.0, gamma: auto}
+  - {kernel: rbf, C: 1.0, gamma: 0.01}
+  - {kernel: rbf, C: 1.0, gamma: 0.1}
+  - {kernel: poly, degree: 2, C: 1.0}
+  - {kernel: poly, degree: 3, C: 1.0}
+lda_grid:
+  - {solver: svd}
+  - {solver: lsqr, shrinkage: auto}
+  - {solver: lsqr, shrinkage: 0.1}
+  - {solver: lsqr, shrinkage: 0.5}
+  - {solver: eigen, shrinkage: auto}
+
+# ---- Ensemble / fusion ------------------------------------------------------
+hard_voting_tie_break: sum_proba          # documented MV/HV tie rule (R2-6)
+ensemble:
+  members: 4
+  operators: [MV, HV, SV, MIN, ST]        # MV, Hard, Soft, Min-prob, Stacking
+member_constraint: same_family            # same_family | unconstrained | partial (R2-8)
+
+# ---- Baselines (all on identical splits/seeds, R1-4/1-5/R2-3) ----------------
+baselines:
+  eegnet:              {enabled: true, epochs: 100, lr: 0.001, batch_size: 32}
+  riemannian:          {enabled: true, estimator: oas}
+  single_best:         {enabled: true}    # B1
+  full_pool_soft_vote: {enabled: true}    # B2
+  random_search:       {enabled: true}    # B3
+
+# ---- v2: pool extension (pool_ext.py) --------------------------------------
+# Off by default so that V0 reproduces the published pipeline exactly.
+# run_v2.py overrides these per variant.
+pool:
+  include_riemannian: false    # per-band covariance -> tangent-space views
+  include_fbcsp: false         # filter-bank CSP (log-var concatenated over bands)
+  fbcsp_select_k: 8            # mutual-information feature selection, null = off
+  riemannian_estimator: oas
+
+# ---- v2: selection machinery (selection.py) --------------------------------
+# Defaults reproduce the published behaviour; see variants.py for the study.
+selection:
+  objective: native            # 'native' (published) | 'val' | 'oof'
+  oof_folds: 5
+  stacking_cv: 0               # 0/1 = in-sample (published), >1 = cross-validated
+  complexity_penalty: 0.0
+  one_se_rule: false
+  top_k_average: 1
+  diversity_weight: 0.0
+
+# ---- Confidence intervals ---------------------------------------------------
+# NOTE: metrics_utils.aggregate_seeds() calls normal_ci(); bootstrap_ci() exists
+# but is not used by the drivers. The published intervals are therefore normal
+# approximations over the seed-level means -- recorded here so the config does
+# not misdescribe what is computed.
+ci:
+  method: normal               # 'normal' (what the code does) | 'bootstrap'
+  n_boot: 2000
+  alpha: 0.05                  # 95% CI
+
+# ---- Datasets ---------------------------------------------------------------
+subjects_ds1: [a, b, f, g]

@@ -1,0 +1,71 @@
+# =============================================================================
+# config_smoke.yaml — a deliberately tiny configuration used only to verify
+# that every v2 code path runs end to end (wiring check, not an experiment).
+# Pool: 4 bands x 3 extractors x 1 component count x 3 classifiers = 36 members.
+# Use config.yaml for anything you intend to report.
+# =============================================================================
+seed: 42
+seeds: [42, 43]
+
+eval_protocol: split
+cv:
+  n_splits: 3
+  n_repeats: 1
+
+window_sizes: [[0, 4], [1, 3]]
+component_options: [[6], [6, 7]]
+
+preprocessing:
+  bandpass_type: butterworth
+  bandpass_order: 5
+  cssp_delay: 2
+  csp_reg: null
+  csp_log: true
+  downsample_to: null
+  artefact_handling: none
+  trial_rejection: none
+  channel_selection: all
+
+sa:
+  iterations: 300
+  temp: 5.0
+  cooling_rate: 0.97
+  nreheat: 20
+  checkpoint_every: 25
+  checkpoint_minutes: 10
+
+random_search:
+  iterations: 300
+
+svm_grid:
+  - {kernel: linear, C: 1.0}
+  - {kernel: rbf, C: 10.0, gamma: scale}
+lda_grid:
+  - {solver: lsqr, shrinkage: auto}
+
+hard_voting_tie_break: sum_proba
+ensemble:
+  members: 4
+  operators: [MV, HV, SV, MIN, ST]
+member_constraint: same_family
+
+# v2 pool extension defaults (switched per variant by run_v2.py)
+pool:
+  include_riemannian: false
+  include_fbcsp: false
+  fbcsp_select_k: 8
+  riemannian_estimator: oas
+
+baselines:
+  eegnet:              {enabled: false, epochs: 3, lr: 0.001, batch_size: 32}
+  riemannian:          {enabled: true, estimator: oas}
+  single_best:         {enabled: true}
+  full_pool_soft_vote: {enabled: true}
+  random_search:       {enabled: true}
+
+ci:
+  method: normal
+  n_boot: 200
+  alpha: 0.05
+
+subjects_ds1: [a, b, f, g]

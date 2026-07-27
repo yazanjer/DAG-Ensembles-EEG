@@ -1,0 +1,29 @@
+# --- Data (do NOT commit; download separately, see reproduce.md) -------------
+dataset/
+BCI Competition IV Dataset 2a/
+*.mat
+*.gdf
+*.npy
+
+# --- Generated outputs -------------------------------------------------------
+results/
+checkpoints/
+*.pkl
+config_used.yaml
+
+# --- Python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+
+# --- OS / editor -------------------------------------------------------------
+.DS_Store
+.vscode/
+.idea/
+
+CODE_REVIEW_LOG.md
+REVIEWER_VERIFICATION.md
