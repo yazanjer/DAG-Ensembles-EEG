@@ -1,0 +1,20 @@
+# Core scientific stack (pins match the environment used for the revision).
+numpy==1.26.4
+scipy==1.17.0
+scikit-learn==1.8.0
+pandas==2.1.4
+matplotlib==3.10.8
+networkx==3.6.1        # used by the legacy implementation_with_test*.py scripts
+PyYAML==6.0.2
+mne==1.11.0
+
+# Non-CNN baseline (Reviewer 1 #5): Riemannian geometry.
+pyriemann==0.7
+
+# CNN baseline (Reviewer 1 #4): EEGNet. On Colab GPU runtimes torch is
+# pre-installed; pinned here for local reproducibility. For a CPU-only wheel:
+#     pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch==2.3.1
+
+# Utilities
+tqdm==4.67.3

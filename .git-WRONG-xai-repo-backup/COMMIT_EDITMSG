@@ -1,0 +1,25 @@
+Fix item 4: make the strong baselines genuinely reachable by the search
+
+Two defects in the first v2 campaign, both of which made item 4 untested:
+
+1. extend_pool() appended RIEM/FB members without registering their feature
+   types on the pool, and _pick_family() draws the family from
+   pool.feature_types. No RIEM or FB member was selectable: 0 of 32 topologies
+   contained one, so V4 was V0 plus 21 dead pool entries.
+
+2. What was added were cousins of the strong baselines, not the baselines. B5
+   runs on unfiltered epochs with a logistic-regression head; the members were
+   band-passed with SVM heads. B4 (EEGNet) was not representable at all.
+
+Adds a RAW view so a whole model can be a pool member, RiemannianExactNode
+(verified to reproduce B5: 0.767 vs 0.767 on subject a / seed 42) and
+EEGNetNode (with the softmax head EEGNetClassifier lacks). Both share the
+STRONG family, so a committee can be a committee of strong baselines.
+
+V4_enriched_pool now embeds the exact B5; new opt-in V7_strong_members adds
+EEGNet. The EEGNet node is code-reviewed but unexecuted - torch was not
+available in the authoring environment.
+
+README_v2 records the campaign-1 result: none of the six changes improved on
+the published method, and the method's own run-to-run variability (SD 17 points
+per unit) exceeds every measured effect.
