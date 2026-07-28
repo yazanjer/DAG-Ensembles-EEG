@@ -37,12 +37,21 @@ import numpy as np
 from scipy.signal import butter, lfilter
 
 # ---- sklearn compatibility patch (older calls pass force_writeable) --------
+# v2 fix: the patch must be idempotent. Re-importing this module (e.g.
+# `importlib.reload(dag_core)` in a notebook, or simply re-running the import
+# cell in Colab) used to re-capture the ALREADY patched function as the
+# "original", so the wrapper called itself: every classifier fit then died with
+# RecursionError and the whole pool was discarded as unfittable.
 import sklearn.utils.validation as _skv
-_orig_check_X_y = _skv.check_X_y
-def _patched_check_X_y(X, y, **kwargs):
-    kwargs.pop("force_writeable", None)
-    return _orig_check_X_y(X, y, **kwargs)
-_skv.check_X_y = _patched_check_X_y
+if not getattr(_skv.check_X_y, "_dagsa_patched", False):
+    _orig_check_X_y = _skv.check_X_y
+
+    def _patched_check_X_y(X, y, **kwargs):
+        kwargs.pop("force_writeable", None)
+        return _orig_check_X_y(X, y, **kwargs)
+
+    _patched_check_X_y._dagsa_patched = True
+    _skv.check_X_y = _patched_check_X_y
 
 from mne.decoding import CSP
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
@@ -220,6 +229,23 @@ class BaseClassifierNode:
     def predict(self, X_dict):
         return self.model.predict(self._data(X_dict))
 
+    def __deepcopy__(self, memo):
+        """Pool members are shared, never copied.
+
+        The search deep-copies a candidate DAG on every perturbation, which
+        used to copy the fitted leaf models too. That is wasteful (four fitted
+        SVMs cloned per iteration) and, once a leaf wraps a torch model, fatal:
+        ``EEGNetClassifier`` holds a reference to the ``torch`` module and
+        ``copy.deepcopy`` raises ``TypeError: cannot pickle 'module' object``.
+
+        Members are immutable after ``fit`` -- the search only ever swaps
+        references to them -- so returning ``self`` is both correct and
+        faster. Operator nodes are still copied properly, which is what
+        matters, since their ``meta_clf`` is mutated during the search.
+        """
+        memo[id(self)] = self
+        return self
+
     def spec(self):
         return {"band": self.band.name, "feature": self.feat_type.name,
                 "n_comp": self.n_comp, "algo": self.algo_type.name,
@@ -250,13 +276,25 @@ class ClassifierPool:
                                                     AlgorithmType.SVM, dict(p), self.seed))
 
     def pre_train_all(self, X_train_dict, y_train):
-        ok = 0
+        """Fit every member; drop the ones that fail.
+
+        v2 fix: the published version counted failures but left the unfitted
+        members in the pool, so the search could select one and then die with
+        ``NotFittedError`` when the topology was scored. Dropping them keeps
+        the pool self-consistent -- an unfittable member is not a candidate.
+        """
+        ok, kept, failed = 0, [], []
         for node in self.pool:
             try:
                 node.fit(X_train_dict, y_train)
+                kept.append(node)
                 ok += 1
-            except Exception:
-                pass
+            except Exception as e:
+                failed.append((node.id, type(e).__name__))
+        if failed:
+            print(f"    [pool] dropped {len(failed)} member(s) that failed to "
+                  f"fit, e.g. {failed[0][0]} ({failed[0][1]})")
+        self.pool = kept
         return ok
 
     def _family_of(self, node):
@@ -385,7 +423,7 @@ class SimulatedAnnealingOptimizer:
     def __init__(self, pool, X_val, y_val, dataset_name, processor, seed=42,
                  members=4, member_constraint="same_family", use_reheat=True,
                  checkpoint_dir=None, checkpoint_minutes=10,
-                 scorer=None, keep_history=0):
+                 scorer=None, keep_history=0, init_family=None):
         """
         v2 additions
         ------------
@@ -398,6 +436,11 @@ class SimulatedAnnealingOptimizer:
             (for one-standard-error selection and top-k averaging).
         """
         self.scorer = scorer
+        # v2: seed the initial committee from one family (e.g. "STRONG", the
+        # exact B5 / EEGNet members). Without this the strong members are 3-5
+        # entries in a 560-member pool and are essentially never sampled, so
+        # "the search can reach them" stays theoretical.
+        self.init_family = init_family
         self.keep_history = int(keep_history)
         self.history_top = []          # list of (score, n_leaves, EnsembleDAG)
         self.pool = pool
@@ -422,6 +465,12 @@ class SimulatedAnnealingOptimizer:
 
     # -- topology helpers ---------------------------------------------------- #
     def _pick_family(self):
+        # v2: with an init family AND the same-family constraint, the committee
+        # is locked to that family -- e.g. a committee made only of the strong
+        # baselines. Without the lock, unconstrained mutations drift away from
+        # the warm start within a few dozen iterations.
+        if self.init_family and self.member_constraint == "same_family":
+            return self.init_family
         if self.member_constraint == "same_family":
             fams = list({_FAMILY[f] for f in self.pool.feature_types})
             return random.choice(fams)
@@ -433,7 +482,11 @@ class SimulatedAnnealingOptimizer:
 
     def _create_dag(self):
         self.family = self._pick_family()
-        bases = self._sample(self.members)
+        if self.init_family and self.start_iter == 0:
+            bases = self.pool.get_random_distinct(k=self.members,
+                                                  family=self.init_family)
+        else:
+            bases = self._sample(self.members)
         # Build `n_pairs` pair-operators then a root over them.
         pair_ops = []
         for i in range(0, len(bases) - 1, 2):

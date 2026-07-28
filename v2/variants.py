@@ -59,6 +59,14 @@ BASE = {
     "include_eegnet": False,            # the paper's B4 itself, as a member
     "include_fbcsp": False,
     "fbcsp_select_k": 8,
+    # None = take it from config.yaml (same_family, the published setting).
+    # NOTE: in dag_core, 'partial' and 'unconstrained' follow the same code
+    # path -- _pick_family returns None for both -- which is why the published
+    # ablation reports identical numbers for them.
+    "member_constraint": None,
+    # Seed the initial committee from this family ("STRONG" = the exact B5 and
+    # EEGNet members). None = the published random initialisation.
+    "init_family": None,
 }
 
 
@@ -90,6 +98,40 @@ VARIANTS = {
     # Dataset 2a, where EEGNet leads by 6.4 points.
     "V7_strong_members": _v(include_riemannian_exact=True, include_eegnet=True,
                             include_fbcsp=True),
+
+    # The same-family constraint makes the strong members effectively
+    # unreachable: the family is drawn once at initialisation, so a committee
+    # of strong baselines happens in only ~1 run in 5, and the STRONG family
+    # holds fewer members than M, so get_random_distinct silently relaxes to
+    # the whole pool. These twins lift the constraint, which is also what one
+    # actually wants from a heterogeneous committee: strong baselines combined
+    # WITH the CSP views. They differ from V0 in two respects (pool and
+    # constraint) by design; V4/V7 above isolate the pool alone.
+    "V4u_enriched_unconstrained": _v(include_riemannian=True,
+                                     include_fbcsp=True,
+                                     include_riemannian_exact=True,
+                                     member_constraint="unconstrained"),
+
+    "V7u_strong_unconstrained": _v(include_riemannian_exact=True,
+                                   include_eegnet=True, include_fbcsp=True,
+                                   member_constraint="unconstrained"),
+
+    # The decisive test of item 4: start from a committee of the strong
+    # baselines themselves and let the search improve on it. If DAG-SA cannot
+    # beat its own members from that starting point, the question is settled.
+    "V7w_strong_warmstart": _v(include_riemannian_exact=True,
+                               include_eegnet=True, include_fbcsp=True,
+                               member_constraint="unconstrained",
+                               init_family="STRONG"),
+
+    # Locked variant: the committee stays inside the STRONG family, so the
+    # model is "EEGNet and the exact B5 baseline fused by the searched
+    # operators". This asks whether fusing the strong baselines beats either
+    # of them alone -- the cleanest possible reading of item 4.
+    "V7l_strong_locked": _v(include_riemannian_exact=True,
+                            include_eegnet=True, include_fbcsp=False,
+                            member_constraint="same_family",
+                            init_family="STRONG"),
 
     "V5_diversity": _v(objective="val", diversity_weight=0.10),
 
@@ -131,6 +173,10 @@ def describe(name):
         "V3_topk_average": "item 3: average of the 5 best topologies",
         "V4_enriched_pool": "item 4: tangent-space, FBCSP and the exact B5 baseline as members",
         "V7_strong_members": "item 4+: the B4 (EEGNet) and B5 baselines themselves as members",
+        "V4u_enriched_unconstrained": "item 4 with the same-family constraint lifted",
+        "V7u_strong_unconstrained": "item 4+ with the same-family constraint lifted",
+        "V7w_strong_warmstart": "item 4+ started from a committee of the strong baselines",
+        "V7l_strong_locked": "item 4+ locked to a committee of the strong baselines",
         "V5_diversity": "item 5: diversity-regularised objective",
         "V6_shrinkage_csp": "item 6: OAS shrinkage for the CSP covariance",
         "VALL_all_six": "all six changes together",

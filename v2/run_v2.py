@@ -57,7 +57,7 @@ def run_unit(Xtr_raw, ytr, Xval_raw, yval, Xte_raw, yte, fs, cfg, seed,
     """Run every requested variant on one split. Returns a list of row dicts."""
     comp = cfg["component_options"][0]
     members = cfg["ensemble"]["members"]
-    member_constraint = cfg.get("member_constraint", "same_family")
+    default_constraint = cfg.get("member_constraint", "same_family")
     sa_cfg = cfg["sa"]
     sa_iters = 5 if tiny else sa_cfg["iterations"]
     feats = (dag_core.FeatureType.CSP, dag_core.FeatureType.CSSP,
@@ -68,6 +68,7 @@ def run_unit(Xtr_raw, ytr, Xval_raw, yval, Xte_raw, yte, fs, cfg, seed,
 
     for vname in variant_names:
         v = V.VARIANTS[vname]
+        member_constraint = v.get("member_constraint") or default_constraint
         sig = V.pool_signature(v)
         t0 = time.monotonic()
 
@@ -130,7 +131,8 @@ def run_unit(Xtr_raw, ytr, Xval_raw, yval, Xte_raw, yte, fs, cfg, seed,
         opt = dag_core.SimulatedAnnealingOptimizer(
             pool, Xval, yval, name, proc, seed=seed, members=members,
             member_constraint=member_constraint, use_reheat=True,
-            checkpoint_dir=None, scorer=scorer, keep_history=keep_hist)
+            checkpoint_dir=None, scorer=scorer, keep_history=keep_hist,
+            init_family=v.get("init_family"))
         best = opt.run(iterations=sa_iters, temp=sa_cfg["temp"],
                        cooling_rate=sa_cfg["cooling_rate"],
                        nreheat=sa_cfg["nreheat"], checkpoint_every=10 ** 9,
@@ -149,7 +151,8 @@ def run_unit(Xtr_raw, ytr, Xval_raw, yval, Xte_raw, yte, fs, cfg, seed,
 
         m = M.classwise_metrics(yte, pred, class_names)
         row = {"subject": name.split("_")[-1], "seed": seed, "variant": vname,
-               "objective": v["objective"], "search_score": float(opt.best_acc),
+               "objective": v["objective"], "constraint": member_constraint,
+               "search_score": float(opt.best_acc),
                "n_pool": len(pool.pool), "seconds": round(time.monotonic() - t0, 1),
                **M.flatten_metrics(m)}
         spec = model.to_spec() if hasattr(model, "to_spec") else {}
@@ -181,7 +184,7 @@ def _val_probs(pool, Xval):
 def run_campaign(dataset="ds1", subjects=None, seeds=None, variant_names=None,
                  experiment=None, project_root=None, config_path=None,
                  dataset_dir=None, tiny=False, variant="binary", window=None,
-                 verbose=True):
+                 verbose=True, resume=True):
     paths, cfg = env_utils.setup_environment(project_root, config_path)
     variant_names = variant_names or V.DEFAULT_ORDER
     experiment = experiment or f"{dataset}_v2"
@@ -195,7 +198,23 @@ def run_campaign(dataset="ds1", subjects=None, seeds=None, variant_names=None,
         subjects = (datasets_io.available_subjects(dataset, ddir)
                     or cfg.get("subjects_ds1"))
 
-    rows, sig_rows = [], []
+    # ---- resume: keep whatever a previous (interrupted) run completed ----
+    rows, sig_rows, completed_units = [], [], set()
+    prev = exp_dir / "v2_per_seed_results.csv"
+    if resume and prev.exists():
+        old = pd.read_csv(prev)
+        keep = old[old.variant.isin(variant_names)] if "variant" in old else old
+        rows = keep.to_dict("records")
+        complete = (keep.groupby(["subject", "seed"]).variant.nunique()
+                    == len(variant_names))
+        completed_units = {(str(s), int(sd))
+                           for (s, sd), ok in complete.items() if ok}
+        sig_prev = exp_dir / "v2_significance.csv"
+        if sig_prev.exists():
+            sig_rows = pd.read_csv(sig_prev).to_dict("records")
+        print(f"[v2] resuming: {len(completed_units)} (subject, seed) units already "
+              f"complete, {len(rows)} rows kept")
+
     t_start = time.monotonic()
     unit_times, n_units = [], len(subjects) * len(seeds)
     print(f"[v2] {experiment}: {len(variant_names)} variants x {n_units} "
@@ -210,12 +229,22 @@ def run_campaign(dataset="ds1", subjects=None, seeds=None, variant_names=None,
         print(f"\n=== {name} | {X.shape[0]} trials | fs={fs} ===")
 
         for seed in seeds:
+            if (str(subject), int(seed)) in completed_units:
+                print(f"  seed {seed}: already complete, skipped")
+                continue
             env_utils.seed_everything(seed)
             t0 = time.monotonic()
             splits = dag_core.three_way_split(X, y, seed)
-            unit_rows, preds = run_unit(*splits, fs, cfg, seed, name, paths,
-                                        variant_names, class_names=class_names,
-                                        tiny=tiny, verbose=verbose)
+            try:
+                unit_rows, preds = run_unit(
+                    *splits, fs, cfg, seed, name, paths, variant_names,
+                    class_names=class_names, tiny=tiny, verbose=verbose)
+            except Exception as e:                     # keep the campaign alive
+                print(f"  !! {name} seed {seed} failed: "
+                      f"{type(e).__name__}: {e}")
+                import traceback; traceback.print_exc()
+                _write(exp_dir, rows, sig_rows)
+                continue
             rows += unit_rows
 
             # paired McNemar of every variant against V0 on the same trials
@@ -320,12 +349,14 @@ def _cli():
     ap.add_argument("--tiny", action="store_true",
                     help="5 SA iterations and 2 inner folds - wiring check only")
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--no-resume", action="store_true",
+                    help="ignore an existing partial run and start over")
     a = ap.parse_args()
     run_campaign(dataset=a.dataset, subjects=a.subjects, seeds=a.seeds,
                  variant_names=a.variants, experiment=a.experiment,
                  project_root=a.project_root, config_path=a.config,
                  dataset_dir=a.dataset_dir, tiny=a.tiny, variant=a.variant,
-                 verbose=not a.quiet)
+                 verbose=not a.quiet, resume=not a.no_resume)
 
 
 if __name__ == "__main__":

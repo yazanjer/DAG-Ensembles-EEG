@@ -55,7 +55,28 @@ exact test applies directly.
 visited topologies. Single-precision band-pass filtering was added to halve peak
 memory (the out-of-fold loop holds two feature pipelines at once).
 
-## Running it
+## Just run everything (recommended)
+
+`DAG_SA_v2_RunAll.ipynb` is the run-and-forget notebook: **Runtime -> Run all**,
+click the Drive authorisation once, and leave it. It runs both strong-member
+campaigns (Dataset 2a, 72 units; Dataset 1, 32 units), resumes after a
+disconnect, survives a failing unit, mirrors everything to
+`results/run_all.log`, and writes a single `results/SUMMARY.md` with the
+accuracy table, the McNemar win/tie/loss column and the diagnostic that says
+whether the search actually selected the strong members. Budget 4-7 h on a GPU
+runtime.
+
+`run_all.py` holds the orchestration, so it can be run headless too:
+
+```bash
+python run_all.py --project-root . --ds1-dir ../EEG/dataset \
+                  --ds2a-dir "../BCI Competition IV Dataset 2a"
+```
+
+`DAG_SA_v2_Colab.ipynb` remains the step-by-step notebook for running single
+campaigns interactively.
+
+## Running it (step by step)
 
 ```bash
 # wiring check, about a minute
@@ -128,10 +149,49 @@ exact B5; the new opt-in **`V7_strong_members`** adds EEGNet.
 The EEGNet node is code-reviewed but **unexecuted** — torch could not be
 installed in the environment where this was written.
 
+### Two further defects found while running campaign 2 (both fixed)
+
+3. **`copy.deepcopy` crashed on torch-backed members.** The search deep-copies a
+   candidate DAG on every perturbation, which copied the leaf models too;
+   `EEGNetClassifier` holds a reference to the `torch` module, so the run died
+   with `TypeError: cannot pickle 'module' object` the moment an EEGNet member
+   entered a topology. `BaseClassifierNode.__deepcopy__` now returns `self` --
+   members are immutable after `fit`, so sharing them is correct, and it also
+   removes four cloned SVMs per iteration.
+4. **The sklearn compatibility patch was not idempotent.** Re-importing
+   `dag_core` (an `importlib.reload`, or simply re-running the import cell in
+   Colab) re-captured the already patched `check_X_y` as the "original", so the
+   wrapper called itself: every fit raised `RecursionError` and the entire pool
+   was discarded as unfittable. The patch is now guarded by a sentinel.
+
+Also: members that fail to fit are now **dropped** from the pool rather than
+left selectable, and a unit that raises is logged and skipped instead of ending
+the campaign. `run_campaign(..., resume=True)` skips `(subject, seed)` units
+already present in the results CSV.
+
+### The constraint problem, and the variants that address it
+
+With `same_family` the strong members are effectively unreachable: the family is
+drawn once at initialisation (~1 run in 5), and the `STRONG` family holds fewer
+members than $M$, so `get_random_distinct` silently relaxes to the whole pool.
+Three new variants give item 4 a fair test:
+
+| Variant | What it does |
+|---|---|
+| `V4u_enriched_unconstrained` | V4 with the constraint lifted -- heterogeneous committees mixing CSP, CTP, tangent-space and FBCSP members |
+| `V7u_strong_unconstrained` | EEGNet and the exact B5 as members, constraint lifted |
+| `V7w_strong_warmstart` | initial committee drawn from the strong baselines, then free to drift |
+| `V7l_strong_locked` | committee **locked** to the strong baselines: EEGNet and B5 fused by the searched operators |
+
+`V7l` is the decisive one -- if fusing the strong baselines does not beat either
+of them alone, item 4 is answered.
+
 ### Campaign 2 (set up, not yet run)
 
 Dataset 2a, nine subjects, eight seeds, variants `V0_published`,
-`V4_enriched_pool`, `V7_strong_members`. That is the dataset where EEGNet leads
+`V4u_enriched_unconstrained`, `V7u_strong_unconstrained`, `V7l_strong_locked`.
+A first attempt stopped after 5 of 72 units on the deepcopy crash above; those
+results are not usable. That is the dataset where EEGNet leads
 by 6.4 points, so it is the only place where embedding the strong baselines can
 plausibly change the answer. Section 6 of the notebook runs it and reports how
 often the search actually selected a strong member.
