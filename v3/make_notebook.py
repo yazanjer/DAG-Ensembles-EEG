@@ -1,9 +1,20 @@
 """
-make_notebook.py -- generate the self-contained Colab notebook.
+make_notebook.py -- generate the Colab notebook.
 
-The notebook embeds the source of every module verbatim, so it has no
-dependency on this repository being present. Running it top to bottom on a
-fresh Colab VM reproduces the whole study.
+Design note: the notebook is a THIN DRIVER. It configures paths, fetches the
+code, and calls three command-line scripts:
+
+    run_study.py    the confirmatory run (resumable)
+    make_report.py  tables + the pre-registered verdict
+    verify.py       integrity checks
+
+No science lives in the notebook. That matters for a paper: a notebook whose
+cells contain the method is impossible to diff, impossible to review, and
+diverges from the repository the moment either is edited. Here the notebook
+and a terminal run execute byte-identical code, and `git log` on v3/ is the
+authoritative history.
+
+Regenerate with:  python make_notebook.py
 """
 from __future__ import annotations
 
@@ -11,8 +22,10 @@ import json
 from pathlib import Path
 
 HERE = Path(__file__).parent
-MODULES = ["data.py", "pipeline.py", "baselines_v3.py", "protocol.py",
-           "analysis.py"]
+OUT = HERE / "DAG_SA_v3_Colab.ipynb"
+
+REPO_URL = "https://github.com/yazanjer/DAG-Ensembles-EEG.git"
+BRANCH = "v3-audit-redesign"
 
 
 def md(src):
@@ -25,172 +38,216 @@ def code(src):
             "outputs": [], "source": src.splitlines(keepends=True)}
 
 
+# --------------------------------------------------------------------------- #
 INTRO = """# DAG-SA v3 — confirmatory evaluation
 
-This notebook runs the whole study end to end, unattended, and is safe to
-re-run after a Colab disconnect: every completed unit is appended to
-`predictions.jsonl` on Drive and skipped on the next run.
+Thin driver. Every cell below calls a script in `v3/`; none of them contain
+method code, so this notebook and a terminal run execute identical code and
+the repository stays the single source of truth.
 
-**What it produces**
+| step | script | produces |
+|---|---|---|
+| 1 | `run_study.py` | `predictions.jsonl`, `preregistration.json`, `run.log` |
+| 2 | `make_report.py` | `report.md`, `report.json`, the verdict |
+| 3 | `verify.py` | integrity checks (exits non-zero on failure) |
 
-1. `preregistration.json` — the protocol, frozen before the run
-2. `predictions.jsonl` — one line per (dataset, subject, seed) unit, holding
-   every method's predictions on the identical test trials
-3. `report.md` / `report.json` — the comparison table (mean ± sd, 95% CI,
-   Cohen's kappa), per-unit paired McNemar with a significance-gated
-   win/tie/loss count, per-subject and class-wise metrics, the ablation, and
-   the verdict against the pre-registered success criterion
-4. `run.log` — a full log
+**Before running**
 
-**Before running**, set `DRIVE_ROOT` below. Datasets are expected at
-`MyDrive/EEG_DAGSA/dataset` (BCI IV Dataset 1) and `MyDrive/EEG_DAGSA/dataset_2a`
-(Dataset 2a).
+1. Datasets on Drive as `MyDrive/EEG_DAGSA/dataset/BCICIV_calib_ds1{a..g}.mat`
+   and `MyDrive/EEG_DAGSA/dataset_2a/A0{1..9}T.mat`
+2. **Runtime → Change runtime type → GPU.** Without one, EEGNet is impractical;
+   it is the baseline most likely to be competitive on Dataset 2a, so leaving
+   it out leaves the comparison incomplete.
+3. Run all.
 
-**Runtime.** Everything except EEGNet is CPU-bound and takes roughly 40 minutes
-for all three datasets. EEGNet dominates the rest; on a T4 the full study is
-about 3–5 hours. Choose a GPU runtime.
+**Resumable.** Each completed unit is appended to `predictions.jsonl` and
+fsync'd. After a disconnect, just run all again — finished units are skipped
+and at most the unit in progress is lost.
+
+**Runtime.** Everything except EEGNet is CPU-bound, roughly 40 minutes for all
+three datasets. EEGNet dominates the rest; on a T4 expect 3–5 hours total.
 """
 
-SETUP = '''# ---- configuration ------------------------------------------------------
-DRIVE_ROOT = "/content/drive/MyDrive/EEG_DAGSA"
-OUT_DIR    = f"{DRIVE_ROOT}/results_v3"
-DS1_DIR    = f"{DRIVE_ROOT}/dataset"
-DS2A_DIR   = f"{DRIVE_ROOT}/dataset_2a"
+CONFIG = '''#@title Configuration { display-mode: "form" }
+DRIVE_ROOT   = "/content/drive/MyDrive/EEG_DAGSA"  #@param {type:"string"}
+DATASETS     = "ds2a_binary,ds1,ds2a_4class"       #@param {type:"string"}
+RUN_EEGNET   = True   #@param {type:"boolean"}
+RUN_ABLATION = True   #@param {type:"boolean"}
 
-RUN_EEGNET   = True     # needs a GPU runtime to be practical
-RUN_ABLATION = True
-DATASETS     = ("ds2a_binary", "ds1", "ds2a_4class")
+CODE_SOURCE  = "github"  #@param ["github", "drive"]
+REPO_URL     = "%(repo)s"  #@param {type:"string"}
+BRANCH       = "%(branch)s"  #@param {type:"string"}
+DRIVE_CODE   = "/content/drive/MyDrive/EEG_DAGSA/code_v3"  #@param {type:"string"}
 
-import os, sys, subprocess
+OUT_DIR  = f"{DRIVE_ROOT}/results_v3"
+CODE_DIR = "/content/dagsa_v3"
+print("results ->", OUT_DIR)
+''' % {"repo": REPO_URL, "branch": BRANCH}
+
+MOUNT = '''# Mount Drive
 try:
     from google.colab import drive
     drive.mount("/content/drive")
 except Exception as e:
-    print("not on Colab or Drive already mounted:", e)
+    print("not on Colab, or already mounted:", e)
 
+import os
 os.makedirs(OUT_DIR, exist_ok=True)
-CODE_DIR = "/content/dagsa_v3"
-os.makedirs(CODE_DIR, exist_ok=True)
-sys.path.insert(0, CODE_DIR)
-print("output ->", OUT_DIR)
 '''
 
-DEPS = '''# ---- dependencies -------------------------------------------------------
-# scipy / scikit-learn / numpy are preinstalled on Colab. torch is needed only
-# for the EEGNet baseline and is preinstalled on GPU runtimes.
-import importlib
-for mod, pip in [("numpy", "numpy"), ("scipy", "scipy"),
-                 ("sklearn", "scikit-learn"), ("pandas", "pandas")]:
+FETCH = '''# Fetch the code. CODE_SOURCE="github" clones the repo; "drive" copies
+# a folder you placed on Drive yourself (use that if the branch is not pushed).
+import os, shutil, subprocess, sys
+
+def sh(*cmd):
+    print("$", " ".join(cmd), flush=True)
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    print(r.stdout[-2000:] or "", end="")
+    if r.returncode != 0:
+        print(r.stderr[-2000:], file=sys.stderr)
+    return r.returncode
+
+if os.path.isdir(CODE_DIR):
+    shutil.rmtree(CODE_DIR)
+
+if CODE_SOURCE == "github":
+    rc = sh("git", "clone", "--depth", "1", "--branch", BRANCH,
+            REPO_URL, "/content/_repo")
+    if rc != 0:
+        raise SystemExit(
+            f"clone of branch '{BRANCH}' failed.\\n"
+            "If the branch is not pushed yet, upload the v3/ folder to Drive "
+            "and set CODE_SOURCE='drive' in the config cell.")
+    shutil.copytree("/content/_repo/v3", CODE_DIR)
+    sh("git", "-C", "/content/_repo", "log", "--oneline", "-1")
+else:
+    if not os.path.isdir(DRIVE_CODE):
+        raise SystemExit(f"DRIVE_CODE not found: {DRIVE_CODE}")
+    shutil.copytree(DRIVE_CODE, CODE_DIR)
+
+sys.path.insert(0, CODE_DIR)
+print("\\ncode in", CODE_DIR)
+print(sorted(f for f in os.listdir(CODE_DIR) if f.endswith(".py")))
+'''
+
+DEPS = '''# Dependencies. numpy/scipy/scikit-learn/pandas ship with Colab; torch is
+# needed only for the EEGNet baseline and ships with GPU runtimes.
+import importlib, subprocess, sys
+for mod, pip in [("numpy","numpy"), ("scipy","scipy"),
+                 ("sklearn","scikit-learn"), ("pandas","pandas")]:
     try:
         importlib.import_module(mod)
     except ImportError:
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", pip],
-                       check=True)
+        subprocess.run([sys.executable,"-m","pip","install","-q",pip], check=True)
 
-import torch
-print("torch", torch.__version__, "| cuda:", torch.cuda.is_available())
-if RUN_EEGNET and not torch.cuda.is_available():
-    print("WARNING: no GPU. EEGNet will be very slow. "
-          "Runtime > Change runtime type > GPU.")
+try:
+    import torch
+    print("torch", torch.__version__, "| cuda:", torch.cuda.is_available())
+    if RUN_EEGNET and not torch.cuda.is_available():
+        print("\\n!! No GPU. EEGNet will be extremely slow.")
+        print("   Runtime > Change runtime type > GPU, then re-run.")
+except ImportError:
+    print("!! torch not available -- EEGNet will be recorded as skipped.")
 '''
 
-RUN = '''# ---- run (resumable) ----------------------------------------------------
-# Safe to re-run after a disconnect: completed units are skipped. Results are
-# written after EVERY unit and fsync'd, so an interrupted session loses at
-# most the unit in progress.
-import importlib
-import protocol as PR
-importlib.reload(PR)
+RUN = '''# Step 1 -- the confirmatory run. Resumable: re-run this cell after a
+# disconnect and completed units are skipped.
+import shlex, subprocess, sys
 
-cfg = PR.RunCfg(
-    ds1_dir=DS1_DIR, ds2a_dir=DS2A_DIR, out_dir=OUT_DIR,
-    datasets=DATASETS, run_eegnet=RUN_EEGNET, run_ablation=RUN_ABLATION,
-)
-PR.run(cfg)
+args = ["--drive-root", DRIVE_ROOT, "--out", OUT_DIR, "--datasets", DATASETS]
+if not RUN_EEGNET:
+    args.append("--no-eegnet")
+if not RUN_ABLATION:
+    args.append("--no-ablation")
+
+cmd = [sys.executable, "-u", f"{CODE_DIR}/run_study.py"] + args
+print("$", " ".join(shlex.quote(c) for c in cmd), "\\n", flush=True)
+
+# Stream output live so a long run shows progress rather than going silent.
+proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, text=True, bufsize=1)
+for line in proc.stdout:
+    print(line, end="")
+proc.wait()
+print("\\nexit code:", proc.returncode)
 '''
 
-REPORT = '''# ---- analysis -----------------------------------------------------------
-import importlib, json
-import analysis as A
-importlib.reload(A)
+REPORT = '''# Step 2 -- tables and the pre-registered verdict.
+import subprocess, sys
+r = subprocess.run([sys.executable, f"{CODE_DIR}/make_report.py",
+                    "--results", OUT_DIR], capture_output=True, text=True)
+print(r.stdout)
+if r.returncode != 0:
+    print(r.stderr, file=sys.stderr)
+'''
 
-report = A.full_report(f"{OUT_DIR}/predictions.jsonl", OUT_DIR)
+VERIFY = '''# Step 3 -- integrity checks.
+# Non-zero exit means something is wrong. The key line is "units per scored
+# method": it must be equal for every row. An unequal row means a method
+# failed on some units and the comparison is not like-for-like (audit B5).
+import subprocess, sys
+r = subprocess.run([sys.executable, f"{CODE_DIR}/verify.py",
+                    "--results", OUT_DIR], capture_output=True, text=True)
+print(r.stdout)
+if r.stderr:
+    print(r.stderr, file=sys.stderr)
+print("exit code:", r.returncode)
+'''
+
+REPORT_DISPLAY = '''# Render report.md inline
 from IPython.display import Markdown, display
-display(Markdown(A.render_markdown(report)))
+from pathlib import Path
+p = Path(OUT_DIR) / "report.md"
+display(Markdown(p.read_text() if p.exists() else "*no report.md yet*"))
 '''
 
-VERDICT = '''# ---- the pre-registered verdict, stated plainly -------------------------
-for ds, d in report["datasets"].items():
-    v = d["verdict"]
-    print(f"\\n=== {ds} ===")
-    print(f"  VERDICT: {v['verdict']}")
-    print(f"  reason : {v['reason']}")
-    print(f"  binding comparison: ARTS vs {v['binding_comparison']}  "
-          f"{v['binding_diff']:+.2f} pts  "
-          f"CI [{v['binding_ci'][0]:+.2f}, {v['binding_ci'][1]:+.2f}]")
-    print("  --- ablation (which component earns the gain) ---")
-    for r in sorted(d["ablation"], key=lambda x: x["method"]):
-        print(f"    {r['method']:22s} {r['acc_mean']:6.2f}")
-
-if "ds1_real_subjects_only" in report:
-    v = report["ds1_real_subjects_only"]["verdict"]
-    print("\\n=== ds1, four REAL subjects only (pre-specified secondary) ===")
-    print(f"  VERDICT: {v['verdict']} ({v['reason']})")
+FILES = '''# What was written
+import os
+for f in sorted(os.listdir(OUT_DIR)):
+    p = os.path.join(OUT_DIR, f)
+    if os.path.isfile(p):
+        print(f"{os.path.getsize(p)/1024:9.1f} KB  {f}")
 '''
 
-INTEGRITY = '''# ---- integrity checks ---------------------------------------------------
-# These are cheap and catch the failure modes the audit found in the previous
-# codebase: silently dropped methods, unequal unit counts, and duplicated rows.
-import collections, json
-recs = [json.loads(l) for l in open(f"{OUT_DIR}/predictions.jsonl") if l.strip()]
+OUTRO = """## Reading the result
 
-keys = [(r["dataset"], str(r["subject"]), r["seed"]) for r in recs]
-dups = [k for k, c in collections.Counter(keys).items() if c > 1]
-print("duplicate units:", len(dups), dups[:5])
+`make_report.py` prints a verdict per dataset against the criterion frozen in
+`preregistration.json`: superiority requires, **against every baseline**, a 95%
+paired CI lower bound above zero *and* a point estimate of at least 2.0
+accuracy points. A CI lying entirely within ±2.0 points is a declared tie.
+Anything else is `INCONCLUSIVE`.
 
-per_method = collections.Counter()
-for r in recs:
-    for m, p in r["pred"].items():
-        if p is not None:
-            per_method[m] += 1
-print("\\nunits per method (these must all be equal):")
-for m, c in sorted(per_method.items(), key=lambda kv: -kv[1]):
-    print(f"   {m:22s} {c}")
+Two things to resist once the numbers appear:
 
-skipped = collections.Counter()
-for r in recs:
-    for m, p in r["pred"].items():
-        if p is None:
-            skipped[m] += 1
-print("\\nexplicitly skipped (recorded, not silently dropped):", dict(skipped))
+* **Do not re-tune after seeing them.** That converts a pre-registered result
+  into a post-hoc one — the exact objection two reviewers already raised.
+* **Do not drop a baseline, subject, seed or metric.** The pre-registration
+  forbids it and the table is meant to be reported in full.
 
-# every method must be scored on exactly the same test trials within a unit
-bad = [k for r, k in zip(recs, keys)
-       if any(len(p) != len(r["y_true"])
-              for p in r["pred"].values() if p is not None)]
-print("units with mismatched prediction lengths:", len(bad))
-'''
+If EEGNet lands above roughly 83 on 2a binary, ARTS no longer leads that
+dataset and the framing has to change: report EEGNet as strongest on 2a and
+ARTS as the strongest non-deep method.
+"""
 
 
 def build():
-    cells = [md(INTRO), code(SETUP), code(DEPS),
-             md("## Source\\n\\nThe modules are written out verbatim so the "
-                "notebook is self-contained.")]
-    for mod in MODULES:
-        src = (HERE / mod).read_text()
-        # JSON-encode rather than embedding in a triple-quoted literal: a
-        # stray ''' or a trailing backslash in the source would otherwise
-        # produce a notebook that looks fine and fails to parse.
-        cell = ("import json\n"
-                "_src = json.loads(%s)\n"
-                "with open(f'{CODE_DIR}/%s', 'w') as f:\n"
-                "    f.write(_src)\n"
-                "print('wrote %s', len(_src), 'chars')\n"
-                % (repr(json.dumps(src)), mod, mod))
-        cells.append(code(cell))
-    cells += [md("## Run"), code(RUN),
-              md("## Results"), code(REPORT), code(VERDICT),
-              md("## Integrity checks"), code(INTEGRITY)]
+    cells = [
+        md(INTRO),
+        code(CONFIG),
+        md("## Setup"),
+        code(MOUNT),
+        code(FETCH),
+        code(DEPS),
+        md("## 1. Run the study"),
+        code(RUN),
+        md("## 2. Report"),
+        code(REPORT),
+        code(REPORT_DISPLAY),
+        md("## 3. Integrity checks"),
+        code(VERIFY),
+        code(FILES),
+        md(OUTRO),
+    ]
 
     nb = {"cells": cells,
           "metadata": {"accelerator": "GPU",
@@ -199,9 +256,9 @@ def build():
                                       "name": "python3"},
                        "language_info": {"name": "python"}},
           "nbformat": 4, "nbformat_minor": 0}
-    out = HERE / "DAG_SA_v3_Colab.ipynb"
-    out.write_text(json.dumps(nb, indent=1))
-    print("wrote", out)
+    OUT.write_text(json.dumps(nb, indent=1))
+    print(f"wrote {OUT}  ({len(cells)} cells, "
+          f"{OUT.stat().st_size/1024:.1f} KB)")
 
 
 if __name__ == "__main__":
