@@ -129,9 +129,32 @@ def _tally(topo, fam_counter, op_counter):
 
 def _plot_ablations(df, abl_dir):
     for label, g in df.groupby("ablation"):
-        factor = [c for c in g.columns if c not in
-                  ("ablation", "subject", "seed", "accuracy")][0]
+        # AUDIT FIX A5 (2026-07-29). `df` is built from heterogeneous dicts,
+        # so its column ORDER is fixed by first appearance:
+        #   [ablation, constraint, subject, seed, accuracy, M, use_reheat,
+        #    iterations]
+        # Taking element [0] of the non-key columns therefore selected
+        # `constraint` for EVERY group. For the ensemble_size, reheating and
+        # sa_budget groups `constraint` is entirely NaN, groupby drops NaN,
+        # and the frame came out empty -- three of the four ablation figures
+        # were blank axes. (Note which one: the reheating ablation is exactly
+        # the experiment that would have exposed audit finding A2.)
+        #
+        # Fix: pick the factor column that this group actually varies.
+        keys = ("ablation", "subject", "seed", "accuracy")
+        cands = [c for c in g.columns
+                 if c not in keys and g[c].notna().any()]
+        if not cands:
+            print(f"    [ablation] '{label}' has no varying factor -- skipped")
+            continue
+        # Prefer a column with more than one distinct value; fall back to the
+        # first populated one so a single-level ablation still plots.
+        varying = [c for c in cands if g[c].nunique(dropna=True) > 1]
+        factor = (varying or cands)[0]
         summ = g.groupby(factor)["accuracy"].agg(["mean", "std"]).reset_index()
+        if summ.empty:
+            print(f"    [ablation] '{label}' produced no rows -- skipped")
+            continue
         fig, ax = plt.subplots(figsize=(7, 4))
         ax.bar(summ[factor].astype(str), summ["mean"],
                yerr=summ["std"].fillna(0), capsize=4, color="#1f77b4", alpha=0.85)

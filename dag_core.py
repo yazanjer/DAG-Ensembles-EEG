@@ -486,11 +486,26 @@ class SimulatedAnnealingOptimizer:
     # -- main loop ----------------------------------------------------------- #
     def run(self, iterations=100, temp=5.0, cooling_rate=0.95, nreheat=20,
             checkpoint_every=25, checkpoint_minutes=None, resume=False,
-            verbose=True):
+            verbose=True, max_reheats=3, reheat_fraction=0.5):
+        """
+        AUDIT FIX A2 (2026-07-29): see the reheat block in the main loop.
+
+        `temp` is also on the wrong scale for this objective. The acceptance
+        rule is exp(-delta / T) where `delta` is a difference of accuracies,
+        i.e. of order 0.01-0.05. A starting temperature of 5.0 makes
+        exp(-0.03/5.0) = 0.994, so essentially every worsening move is
+        accepted. Callers should pass a temperature on the order of the
+        objective's own scale (0.02-0.05). config.yaml has been updated
+        accordingly; the default here is left at 5.0 only so that existing
+        call sites do not change behaviour silently -- they will get the
+        bounded reheat schedule, which is the correctness fix.
+        """
         if checkpoint_minutes is None:
             checkpoint_minutes = self.checkpoint_minutes
         if resume:
             self.try_resume()
+        temp0 = temp
+        n_reheats = 0
         curr_acc = self.current_dag.accuracy(self.X_val, self.y_val)
         if self.best_acc == 0.0:
             self.best_acc = curr_acc
@@ -524,8 +539,22 @@ class SimulatedAnnealingOptimizer:
             self.history["best_accuracy"].append(self.best_acc)
             temp *= cooling_rate
             stagnant += 1
-            if self.use_reheat and stagnant > nreheat:
-                temp *= 1.5
+            # AUDIT FIX A2 (2026-07-29). `stagnant` is reset only when a new
+            # GLOBAL best is found (see above), which in the late phase is
+            # rare -- so the reheat fired roughly every nreheat+1 iterations
+            # and the effective cooling factor became
+            #     0.97 * 1.5**(1/21) = 0.9888,  not 0.97.
+            # Under the shipped config (T0=5.0, cooling=0.97, nreheat=20,
+            # 300 iters) the chain accepted a 3-point-WORSE topology with
+            # probability 0.83 on the FINAL iteration; there was no greedy
+            # phase at any point, which made DAG-SA equivalent to best-of-N
+            # uniform sampling, i.e. to the random-search baseline.
+            # Fix: reheat from the ORIGINAL temperature ladder rather than
+            # multiplying the current one, and cap the number of reheats so
+            # the schedule is guaranteed to terminate cold.
+            if self.use_reheat and stagnant > nreheat and n_reheats < max_reheats:
+                temp = temp0 * (reheat_fraction ** (n_reheats + 1))
+                n_reheats += 1
                 stagnant = 0
             now = time.monotonic()
             self.elapsed_seconds += now - loop_start

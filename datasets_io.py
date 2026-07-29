@@ -249,8 +249,18 @@ def load_dataset(name: str, dataset_dir, subject,
         return load_ds1_subject(dataset_dir, str(subject),
                                 window=window or (0.0, 4.0))
     if name == "ds2a":
+        # AUDIT FIX A3 (2026-07-29). This dispatcher used to default to
+        # (0.5, 4.5), silently overriding load_ds2a_subject's documented
+        # (2.0, 6.0). In Dataset 2a the `trial` field marks FIXATION onset:
+        # the cue appears at ~2 s and motor imagery runs ~3-6 s. The old
+        # window was therefore 1.5 s of fixation, plus the cue-evoked
+        # response, plus only the first ~1.5 s of imagery -- so every 2a
+        # number in the paper was not measuring the imagery period it was
+        # described as measuring, and was not comparable to the 2a
+        # literature. Defaulting to None lets the loader's own documented
+        # default apply.
         return load_ds2a_subject(dataset_dir, int(subject),
-                                 window=window or (0.5, 4.5),
+                                 window=window or (2.0, 6.0),
                                  variant=variant, session=session)
     raise ValueError(f"Unknown dataset '{name}'. Use 'ds1' or 'ds2a'.")
 

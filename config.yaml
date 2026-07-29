@@ -35,9 +35,18 @@ preprocessing:
 # ---- Simulated annealing ----------------------------------------------------
 sa:
   iterations: 300
-  temp: 5.0
+  # AUDIT FIX A2 (2026-07-29). temp was 5.0. The acceptance rule is
+  # exp(-delta/T) where delta is a difference of ACCURACIES (order 0.01-0.05),
+  # so T=5.0 gives exp(-0.03/5.0) = 0.994 -- essentially every worsening move
+  # accepted. Combined with the reheat bug (which reset the cooling schedule
+  # roughly every 21 iterations) the chain never left the near-random regime,
+  # making DAG-SA equivalent to best-of-N uniform sampling. T is now on the
+  # scale of the objective.
+  temp: 0.05
   cooling_rate: 0.97
   nreheat: 20
+  max_reheats: 3          # bounded, so the schedule terminates cold
+  reheat_fraction: 0.5    # each reheat restarts at half the previous ladder
   checkpoint_every: 25         # periodic checkpoint cadence in iterations (Section A.3)
   checkpoint_minutes: 10       # wall-clock checkpoint cadence in minutes (Section B.1)
 

@@ -80,16 +80,29 @@ def bootstrap_ci(y_true, y_pred, metric=accuracy_score, n_boot=2000,
 
 
 def normal_ci(values: Sequence[float], alpha=0.05):
-    """Normal-approx mean ± z*se across repeated measurements (e.g. seeds)."""
+    """
+    Mean ± t*se across repeated measurements.
+
+    AUDIT FIX A4(i) (2026-07-29). This used the standard normal quantile
+    (z = 1.96) with n = 8 replicates, where Student's t on n-1 df is
+    required: t(0.975, 7) = 2.3646. Every 95% interval the repository
+    produced was therefore 20.6% too narrow. The function keeps its name so
+    call sites are unchanged, but it is no longer a normal approximation.
+    """
     v = np.asarray(values, dtype=float)
     n = len(v)
     mean = float(v.mean())
     if n < 2:
         return mean, float("nan"), float("nan"), 0.0
     sd = float(v.std(ddof=1))
-    z = 1.959963985 if abs(alpha - 0.05) < 1e-9 else _z_for(alpha)
-    half = z * sd / sqrt(n)
+    crit = _t_for(alpha, n - 1)
+    half = crit * sd / sqrt(n)
     return mean, mean - half, mean + half, sd
+
+
+def _t_for(alpha, df):
+    from scipy.stats import t
+    return float(t.ppf(1 - alpha / 2, df))
 
 
 def _z_for(alpha):

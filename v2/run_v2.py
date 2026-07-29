@@ -67,6 +67,26 @@ def run_unit(Xtr_raw, ytr, Xval_raw, yval, Xte_raw, yte, fs, cfg, seed,
     pool_cache, oof_cache = {}, {}
 
     for vname in variant_names:
+        # AUDIT FIX E1 (2026-07-29) -- INVALIDATES THE WHOLE v2 CAMPAIGN.
+        # seed_everything() was called once per (subject, seed) unit, OUTSIDE
+        # this loop, and SimulatedAnnealingOptimizer never re-seeds (grep:
+        # `random.seed` appears nowhere in dag_core.py -- the optimiser only
+        # CONSUMES the global stream). So V0 burned ~1200+ random draws, V1
+        # started wherever V0 left off, V2 wherever V1 left off, and so on:
+        # every variant ran a DIFFERENT annealing trajectory. Only
+        # V0_published began from a fresh seed state.
+        #
+        # The campaign's own control measurement says trajectory-only
+        # variation moves a unit by 17 accuracy points (sd), which puts the
+        # standard error of a 32-unit mean difference at ~3 points. That SE
+        # is NOT a property of the method -- it is this bug. Under it,
+        # "0 wins / 32 ties / 0 losses" is the mathematically expected
+        # outcome whether or not a variant works, so none of the six ideas
+        # was actually tested.
+        #
+        # Re-seeding here makes the variants paired on the SEARCH as well as
+        # on the split, which is what the design claimed.
+        env_utils.seed_everything(seed)
         v = V.VARIANTS[vname]
         member_constraint = v.get("member_constraint") or default_constraint
         sig = V.pool_signature(v)

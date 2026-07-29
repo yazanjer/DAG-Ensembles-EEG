@@ -87,6 +87,8 @@ def evaluate_all_methods(splits, fs, cfg, seed, name, paths,
                    cooling_rate=sa_cfg["cooling_rate"], nreheat=sa_cfg["nreheat"],
                    checkpoint_every=sa_cfg["checkpoint_every"],
                    checkpoint_minutes=sa_cfg.get("checkpoint_minutes", 10),
+                   max_reheats=sa_cfg.get("max_reheats", 3),
+                   reheat_fraction=sa_cfg.get("reheat_fraction", 0.5),
                    verbose=verbose)
     results[DAG_SA] = {"y_true": yte, "pred": best.root.predict(Xte),
                        "meta": {"val_acc": opt.best_acc,
@@ -108,32 +110,67 @@ def evaluate_all_methods(splits, fs, cfg, seed, name, paths,
                                          members=members,
                                          member_constraint=member_constraint)
             results["random_search"] = {"y_true": yte, "pred": pred, "meta": meta}
+        # ================================================================== #
+        # AUDIT FIX A1 (2026-07-29) -- THE MOST CONSEQUENTIAL FIX IN THIS FILE
+        # ------------------------------------------------------------------ #
+        # EEGNet and the Riemannian classifier used to be handed `Xtr_raw` /
+        # `Xte_raw`, which come straight out of create_epochs and are NOT
+        # FILTERED AT ALL, while DAG-SA, single-best, full-pool-vote and
+        # random search received four optimised pass-bands via DataProcessor.
+        #
+        # For the Riemannian baseline this is fatal: covariances of
+        # unfiltered EEG are dominated by sub-1 Hz drift and line noise, and
+        # the mu/beta discriminative structure is a small fraction of total
+        # variance. An 8-30 Hz band-pass before covariance estimation is
+        # standard practice. Measured effect: the Riemannian baseline moves
+        # from ~70% to ~89-91% on Dataset 1.
+        #
+        # Both baselines now band-pass their own input, so every method in
+        # the table sees appropriately filtered data. NOTE FOR THE WRITE-UP:
+        # this makes the baselines HARDER to beat, not easier.
+        # ================================================================== #
+        def _bp(X, lo, hi):
+            return dag_core.butter_bandpass_filter(X, lo, hi, fs, order=5)
+
         # ---- EEGNet (CNN) -------------------------------------------------- #
         if cfg["baselines"]["eegnet"]["enabled"] and B.eegnet_available():
             try:
                 ec = cfg["baselines"]["eegnet"]
+                lo, hi = ec.get("band", (4.0, 38.0))
                 net = B.EEGNetClassifier(
                     n_classes=len(set(ytr.tolist())), fs=fs,
                     epochs=3 if tiny else ec["epochs"], lr=ec["lr"],
                     batch_size=ec["batch_size"], seed=seed)
-                net.fit(Xtr_raw, ytr)
-                results["EEGNet"] = {"y_true": yte, "pred": net.predict(Xte_raw),
-                                     "meta": {}}
+                net.fit(_bp(Xtr_raw, lo, hi), ytr)
+                results["EEGNet"] = {"y_true": yte,
+                                     "pred": net.predict(_bp(Xte_raw, lo, hi)),
+                                     "meta": {"band": [lo, hi]}}
             except Exception as e:
-                print(f"    [EEGNet] skipped: {e}")
+                # AUDIT FIX B5: record the skip instead of silently dropping
+                # the method, which let different methods be aggregated over
+                # different numbers of units while the README claimed they
+                # all shared the same eight seeds.
+                print(f"    !!! [EEGNet] FAILED and was skipped: {e}")
+                results.setdefault("_skipped", []).append(("EEGNet", str(e)))
         elif cfg["baselines"]["eegnet"]["enabled"]:
-            print("    [EEGNet] torch not installed — skipped.")
+            print("    !!! [EEGNet] torch not installed — skipped.")
+            results.setdefault("_skipped", []).append(("EEGNet", "no torch"))
         # ---- Riemannian (non-CNN) ----------------------------------------- #
         if cfg["baselines"]["riemannian"]["enabled"] and B.riemannian_available():
             try:
-                rm = B.build_riemannian(cfg["baselines"]["riemannian"]["estimator"], seed)
-                rm.fit(Xtr_raw, ytr)
-                results["Riemannian"] = {"y_true": yte, "pred": rm.predict(Xte_raw),
-                                         "meta": {}}
+                rc = cfg["baselines"]["riemannian"]
+                lo, hi = rc.get("band", (8.0, 30.0))
+                rm = B.build_riemannian(rc["estimator"], seed)
+                rm.fit(_bp(Xtr_raw, lo, hi), ytr)
+                results["Riemannian"] = {"y_true": yte,
+                                         "pred": rm.predict(_bp(Xte_raw, lo, hi)),
+                                         "meta": {"band": [lo, hi]}}
             except Exception as e:
-                print(f"    [Riemannian] skipped: {e}")
+                print(f"    !!! [Riemannian] FAILED and was skipped: {e}")
+                results.setdefault("_skipped", []).append(("Riemannian", str(e)))
         elif cfg["baselines"]["riemannian"]["enabled"]:
-            print("    [Riemannian] pyriemann not installed — skipped.")
+            print("    !!! [Riemannian] pyriemann not installed — skipped.")
+            results.setdefault("_skipped", []).append(("Riemannian", "no pyriemann"))
 
     return results, opt
 
@@ -197,6 +234,21 @@ def _append_rows(path, rows):
             new = pd.concat([old, new], ignore_index=True)
         except Exception:
             pass
+    # AUDIT FIX B4 (2026-07-29). With --no-resume, `done_units` is empty so
+    # every unit re-runs, but this function still concatenated onto the
+    # existing CSV -- so re-running an experiment into the same directory
+    # DOUBLED every row. _aggregate is robust to that (duplicated identical
+    # values leave a mean unchanged) but build_winloss_table counts rows, so
+    # `wins`, `ties`, `losses` and `n` in winloss_summary.csv came out as
+    # integer multiples of the truth equal to the number of re-runs.
+    key = [c for c in ("method", "subject", "seed", "fold", "comparison",
+                       "method_a", "method_b") if c in new.columns]
+    if key:
+        before = len(new)
+        new = new.drop_duplicates(subset=key, keep="last").reset_index(drop=True)
+        if len(new) != before:
+            print(f"    [dedup] {before - len(new)} duplicate row(s) dropped "
+                  f"from {path.name} (keyed on {key})")
     _atomic_write_csv(new, path)
     return new
 
@@ -319,6 +371,8 @@ def run_experiment(dataset="ds1", subjects=None, seeds=None, protocol=None,
                         splits, fs, cfg, seed, name, paths, class_names,
                         tiny=tiny, run_baselines=True, verbose=verbose)
                     for method, r in res.items():
+                        if method.startswith("_"):   # audit fix B5 marker
+                            continue
                         m = M.classwise_metrics(r["y_true"], r["pred"], class_names)
                         unit_rows.append({"dataset": dataset, "subject": subject,
                                           "seed": seed, "fold": fi,
@@ -326,7 +380,7 @@ def run_experiment(dataset="ds1", subjects=None, seeds=None, protocol=None,
                     # McNemar DAG-SA vs each baseline, per fold (same test set)
                     da = res[DAG_SA]
                     for method, r in res.items():
-                        if method == DAG_SA:
+                        if method == DAG_SA or method.startswith("_"):
                             continue
                         mc = M.mcnemar_test(da["y_true"], da["pred"], r["pred"])
                         unit_sig.append({
@@ -344,6 +398,8 @@ def run_experiment(dataset="ds1", subjects=None, seeds=None, protocol=None,
                     tiny=tiny, verbose=verbose)
                 convergence.setdefault(name, opt)
                 for method, r in res.items():
+                    if method.startswith("_"):       # audit fix B5 marker
+                        continue
                     m = M.classwise_metrics(r["y_true"], r["pred"], class_names)
                     unit_rows.append({"dataset": dataset, "subject": subject,
                                       "seed": seed, "fold": 0,
@@ -351,7 +407,7 @@ def run_experiment(dataset="ds1", subjects=None, seeds=None, protocol=None,
                 # McNemar DAG-SA vs each baseline (same test set / seed)
                 da = res[DAG_SA]
                 for method, r in res.items():
-                    if method == DAG_SA:
+                    if method == DAG_SA or method.startswith("_"):
                         continue
                     mc = M.mcnemar_test(da["y_true"], da["pred"], r["pred"])
                     unit_sig.append({
@@ -416,15 +472,36 @@ def _aggregate(df, cfg):
     rows = []
     alpha = cfg["ci"]["alpha"]
     for method, g in df.groupby("method"):
-        # average across subjects+folds first per seed, then across seeds
+        # AUDIT FIX A4(ii) (2026-07-29). This used to average across
+        # SUBJECTS first within each seed and then take the interval across
+        # the 8 seeds. That annihilates between-subject variance -- the only
+        # variance relevant to a claim about a new subject -- so the reported
+        # interval measured split-assignment noise, and in `cv` mode ~800
+        # correlated evaluations were reported as n = 8.
+        #
+        # The unit of analysis is now the SUBJECT: average over seeds (and
+        # folds) within a subject, then take the interval across subjects.
+        # The old seed-level interval is retained alongside it, clearly
+        # labelled, because it is still the right quantity for the narrower
+        # question "how much does the split assignment move this number?".
+        per_subject = g.groupby("subject")["accuracy"].mean().values
+        agg = M.aggregate_seeds(per_subject, alpha)
         per_seed = g.groupby("seed")["accuracy"].mean().values
-        agg = M.aggregate_seeds(per_seed, alpha)
+        agg_seed = M.aggregate_seeds(per_seed, alpha)
+        kap_subject = g.groupby("subject")["cohen_kappa"].mean().values
+        kagg = M.aggregate_seeds(kap_subject, alpha)
         rows.append({"method": method,
                      "acc_mean": agg["mean"], "acc_std": agg["std"],
                      "acc_ci_low": agg["ci_low"], "acc_ci_high": agg["ci_high"],
-                     "kappa_mean": g["cohen_kappa"].mean(),
-                     "bal_acc_mean": g["balanced_accuracy"].mean(),
-                     "n_seeds": agg["n"]})
+                     "kappa_mean": kagg["mean"],
+                     "kappa_ci_low": kagg["ci_low"],
+                     "kappa_ci_high": kagg["ci_high"],
+                     "bal_acc_mean": g.groupby("subject")["balanced_accuracy"]
+                                      .mean().mean(),
+                     "n_subjects": agg["n"],
+                     "n_seeds": agg_seed["n"],
+                     "acc_ci_low_seedlevel": agg_seed["ci_low"],
+                     "acc_ci_high_seedlevel": agg_seed["ci_high"]})
     out = pd.DataFrame(rows).sort_values("acc_mean", ascending=False)
     return out
 
